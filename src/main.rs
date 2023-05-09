@@ -1,71 +1,64 @@
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
-use hyper::http::StatusCode;
+use futures::{sink::SinkExt, stream::StreamExt};
+use hyper::{Body, Request, Response};
+use hyper_tungstenite::{tungstenite, HyperWebsocket};
 use std::convert::Infallible;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
-use futures_util::SinkExt;
-use futures_util::StreamExt;
+
+type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 static INDEX_HTML: &str = include_str!("index.html");
 
-async fn handle_request(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html")
-        .body(INDEX_HTML.into())
-        .unwrap();
-    Ok(response)
-}
+async fn handle_request(mut request: Request<Body>) -> Result<Response<Body>, Error> {
+    if hyper_tungstenite::is_upgrade_request(&request) {
+        let (response, websocket) = hyper_tungstenite::upgrade(&mut request, None)?;
 
-async fn http_server() {
-    let make_svc = make_service_fn(|_conn| {
-        let svc = service_fn(handle_request);
-        async move { Ok::<_, Infallible>(svc) }
-    });
+        tokio::spawn(async move {
+            if let Err(e) = serve_websocket(websocket).await {
+                eprintln!("Error in websocket connection: {}", e);
+            }
+        });
 
-    let addr = ([127, 0, 0, 1], 7777).into();
-    let server = Server::bind(&addr).serve(make_svc);
-
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+        Ok(response)
+    } else {
+        Ok(Response::new(Body::from(INDEX_HTML)))
     }
 }
 
-async fn accept_connection(stream: TcpStream) {
-    let ws_stream = tokio_tungstenite::accept_async(stream)
-        .await
-        .expect("Failed to accept websocket connection");
+async fn serve_websocket(websocket: HyperWebsocket) -> Result<(), Error> {
+    let mut websocket = websocket.await?;
 
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-    while let Some(msg) = ws_receiver.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
+    while let Some(message) = websocket.next().await {
+        match message? {
+            tungstenite::Message::Text(text) => {
                 println!("Received a message: {}", text);
-                ws_sender.send(Message::Text(text.to_uppercase())).await.unwrap();
-            }
-            Ok(Message::Close(_)) => {
-                break;
+                websocket.send(tungstenite::Message::Text(text.to_uppercase())).await?;
             }
             _ => (),
         }
     }
-}
 
-async fn ws_server() {
-    let addr = "127.0.0.1:9000";
-    let listener = TcpListener::bind(&addr).await.unwrap();
-    println!("Listening on: {}", addr);
-
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(accept_connection(stream));
-    }
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
-    let http = http_server();
-    let ws = ws_server();
-    tokio::join!(http, ws);
+async fn main() -> Result<(), Error> {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], 7777).into();
+    println!("Listening on http://{}", addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    let mut http = hyper::server::conn::Http::new();
+    http.http1_only(true);
+    http.http1_keep_alive(true);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let connection = http
+            .serve_connection(stream, hyper::service::service_fn(handle_request))
+            .with_upgrades();
+
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                println!("Error serving HTTP connection: {:?}", err);
+            }
+        });
+    }
 }
