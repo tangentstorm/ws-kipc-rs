@@ -1,0 +1,12 @@
+[package]
+name = "ws-kipc-rs"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tungstenite = "0.15.0"
+tokio-tungstenite = "0.15.0"
+futures-util = "0.3.17"
+hyper = { version = "0.14", features = ["full"] }
+http-body-util = "0.1.0-rc.2"
